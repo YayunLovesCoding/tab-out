@@ -620,6 +620,8 @@ function stripTitleNoise(title) {
   // Strip email addresses (privacy + cleaner display)
   title = title.replace(/\s*[\-\u2010-\u2015]\s*[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '');
   title = title.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '');
+  // Strip Google Workspace product suffixes so Docs/Sheets titles stay readable
+  title = title.replace(/\s*[\-\u2010-\u2015|]\s*Google (Docs|Sheets|Slides|Forms|Drive|Drawings|Sites|Workspace)\s*$/i, '');
   // Clean X/Twitter format
   title = title.replace(/\s+on X:\s*/, ': ');
   title = title.replace(/\s*\/\s*X\s*$/, '');
@@ -689,6 +691,295 @@ function smartTitle(title, url) {
   }
 
   return title || url;
+}
+
+function getTabDisplayTitle(tab, hostname = '') {
+  return cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), hostname);
+}
+
+
+/* ----------------------------------------------------------------
+   GOOGLE WORKSPACE GROUPING HELPERS
+   ---------------------------------------------------------------- */
+
+const GOOGLE_WORKSPACE_APPS = [
+  { key: 'google-docs',     label: 'Google Docs',     hostname: 'docs.google.com',  pathPrefix: '/document/',      projectable: true  },
+  { key: 'google-sheets',   label: 'Google Sheets',   hostname: 'docs.google.com',  pathPrefix: '/spreadsheets/',  projectable: true  },
+  { key: 'google-slides',   label: 'Google Slides',   hostname: 'docs.google.com',  pathPrefix: '/presentation/',  projectable: true  },
+  { key: 'google-forms',    label: 'Google Forms',    hostname: 'docs.google.com',  pathPrefix: '/forms/',         projectable: false },
+  { key: 'google-drawings', label: 'Google Drawings', hostname: 'docs.google.com',  pathPrefix: '/drawings/',      projectable: false },
+  { key: 'google-drive',    label: 'Google Drive',    hostname: 'drive.google.com',                           projectable: false },
+];
+
+const WORKSPACE_PROJECT_SEPARATORS = [' - ', ' | ', ' — ', ' – ', ' · ', ': ', ' / '];
+
+const WORKSPACE_PROJECT_WORD_STOPWORDS = new Set([
+  'agenda',
+  'archive',
+  'backup',
+  'brainstorm',
+  'brainstorming',
+  'copy',
+  'daily',
+  'deck',
+  'document',
+  'documents',
+  'draft',
+  'drafts',
+  'drive',
+  'form',
+  'forms',
+  'google',
+  'meeting',
+  'meetings',
+  'misc',
+  'monthly',
+  'my',
+  'notes',
+  'plan',
+  'planning',
+  'presentation',
+  'presentations',
+  'project',
+  'projects',
+  'review',
+  'reviews',
+  'retro',
+  'retrospective',
+  'sheet',
+  'sheets',
+  'slides',
+  'spreadsheet',
+  'spreadsheets',
+  'summary',
+  'summaries',
+  'sync',
+  'task',
+  'tasks',
+  'template',
+  'templates',
+  'todo',
+  'tracker',
+  'trackers',
+  'untitled',
+  'weekly',
+  'workspace',
+]);
+
+const WORKSPACE_PROJECT_LABEL_STOPWORDS = new Set([
+  'agenda',
+  'brainstorm',
+  'copy of',
+  'daily sync',
+  'draft',
+  'meeting notes',
+  'my drive',
+  'notes',
+  'retrospective',
+  'shared with me',
+  'task tracker',
+  'template',
+  'todo',
+  'untitled',
+  'weekly review',
+  'weekly sync',
+]);
+
+const PROJECT_CANDIDATE_KIND_RANK = {
+  tag:   0,
+  prefix: 1,
+  lead2: 2,
+  lead1: 3,
+};
+
+function getGoogleWorkspaceInfo(url) {
+  try {
+    const parsed = new URL(url);
+    const exact = GOOGLE_WORKSPACE_APPS.find(app => (
+      parsed.hostname === app.hostname &&
+      (!app.pathPrefix || parsed.pathname.startsWith(app.pathPrefix))
+    ));
+    if (exact) return exact;
+
+    if (parsed.hostname === 'docs.google.com') {
+      return {
+        key:         'google-workspace',
+        label:       'Google Workspace',
+        hostname:    parsed.hostname,
+        projectable: false,
+      };
+    }
+  } catch {}
+
+  return null;
+}
+
+function normalizeProjectLabel(label) {
+  return (label || '')
+    .replace(/^[#@]/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function projectLabelKey(label) {
+  return normalizeProjectLabel(label)
+    .toLowerCase()
+    .replace(/[^\w\s/&+-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isGenericProjectLabel(label) {
+  const normalized = normalizeProjectLabel(label);
+  const key = projectLabelKey(normalized);
+  if (!key || key.length < 3 || key.length > 40) return true;
+  if (/^\d+$/.test(key)) return true;
+  if (WORKSPACE_PROJECT_LABEL_STOPWORDS.has(key)) return true;
+
+  const words = key.split(' ').filter(Boolean);
+  if (words.length === 0) return true;
+  if (words.every(word => WORKSPACE_PROJECT_WORD_STOPWORDS.has(word))) return true;
+
+  return false;
+}
+
+function addProjectCandidate(candidates, seenKeys, label, kind) {
+  const normalized = normalizeProjectLabel(label)
+    .replace(/^\[([^\]]+)\]$/, '$1')
+    .replace(/^\(([^\)]+)\)$/, '$1')
+    .replace(/^\s*copy of\s+/i, '')
+    .replace(/^\s*draft\s*[:\-]\s*/i, '')
+    .trim();
+  const key = projectLabelKey(normalized);
+
+  if (!normalized || seenKeys.has(key) || isGenericProjectLabel(normalized)) return;
+
+  seenKeys.add(key);
+  candidates.push({ key, label: normalized, kind });
+}
+
+function extractWorkspaceProjectCandidates(title) {
+  const clean = normalizeProjectLabel(title);
+  if (!clean) return [];
+
+  const candidates = [];
+  const seenKeys = new Set();
+
+  const bracketMatch = clean.match(/^\[([^\]]{3,40})\]/);
+  if (bracketMatch) addProjectCandidate(candidates, seenKeys, bracketMatch[1], 'tag');
+
+  const parenMatch = clean.match(/^\(([^\)]{3,40})\)/);
+  if (parenMatch) addProjectCandidate(candidates, seenKeys, parenMatch[1], 'tag');
+
+  for (const sep of WORKSPACE_PROJECT_SEPARATORS) {
+    const idx = clean.indexOf(sep);
+    if (idx > 0) addProjectCandidate(candidates, seenKeys, clean.slice(0, idx), 'prefix');
+  }
+
+  const words = clean.match(/[A-Za-z0-9][A-Za-z0-9&+.'/-]*/g) || [];
+  if (words.length >= 2) addProjectCandidate(candidates, seenKeys, words.slice(0, 2).join(' '), 'lead2');
+  if (words.length >= 1) addProjectCandidate(candidates, seenKeys, words[0], 'lead1');
+
+  return candidates;
+}
+
+function buildGoogleWorkspaceGroups(tabs) {
+  const entries = [];
+
+  for (const tab of tabs) {
+    const info = getGoogleWorkspaceInfo(tab.url);
+    if (!info) continue;
+
+    const title = getTabDisplayTitle(tab, info.hostname);
+    entries.push({
+      tab,
+      info,
+      title,
+      candidates: info.projectable ? extractWorkspaceProjectCandidates(title) : [],
+    });
+  }
+
+  const appCandidateCounts = {};
+
+  for (const entry of entries) {
+    if (!entry.info.projectable || entry.candidates.length === 0) continue;
+
+    const appKey = entry.info.key;
+    if (!appCandidateCounts[appKey]) appCandidateCounts[appKey] = {};
+
+    for (const candidate of entry.candidates) {
+      if (!appCandidateCounts[appKey][candidate.key]) {
+        appCandidateCounts[appKey][candidate.key] = {
+          label:     candidate.label,
+          kind:      candidate.kind,
+          kindRank:  PROJECT_CANDIDATE_KIND_RANK[candidate.kind],
+          urls:      new Set(),
+        };
+      }
+
+      const bucket = appCandidateCounts[appKey][candidate.key];
+      bucket.urls.add(entry.tab.url);
+
+      const candidateRank = PROJECT_CANDIDATE_KIND_RANK[candidate.kind];
+      if (candidateRank < bucket.kindRank) {
+        bucket.kind = candidate.kind;
+        bucket.kindRank = candidateRank;
+        bucket.label = candidate.label;
+      }
+    }
+  }
+
+  const promotedProjects = {};
+
+  for (const [appKey, buckets] of Object.entries(appCandidateCounts)) {
+    promotedProjects[appKey] = {};
+
+    for (const [candidateKey, bucket] of Object.entries(buckets)) {
+      if (bucket.urls.size < 2) continue;
+      promotedProjects[appKey][candidateKey] = {
+        label: bucket.label,
+        count: bucket.urls.size,
+        kind:  bucket.kind,
+      };
+    }
+  }
+
+  const assignments = new Map();
+
+  for (const entry of entries) {
+    const baseKey = `__workspace__:${entry.info.key}`;
+    let groupKey = baseKey;
+    let groupLabel = entry.info.label;
+
+    const availableProjects = promotedProjects[entry.info.key] || {};
+    const matchingProjects = entry.candidates
+      .filter(candidate => availableProjects[candidate.key])
+      .sort((a, b) => {
+        const rankDiff = PROJECT_CANDIDATE_KIND_RANK[a.kind] - PROJECT_CANDIDATE_KIND_RANK[b.kind];
+        if (rankDiff !== 0) return rankDiff;
+
+        const countDiff = availableProjects[b.key].count - availableProjects[a.key].count;
+        if (countDiff !== 0) return countDiff;
+
+        return b.label.length - a.label.length;
+      });
+
+    if (matchingProjects.length > 0) {
+      const best = matchingProjects[0];
+      const project = availableProjects[best.key];
+      groupKey = `${baseKey}:${best.key.replace(/\s+/g, '-')}`;
+      groupLabel = `${entry.info.label}: ${project.label}`;
+    }
+
+    assignments.set(entry.tab.id, {
+      key:          groupKey,
+      label:        groupLabel,
+      titleHostname: entry.info.hostname,
+      sortRank:     20,
+    });
+  }
+
+  return assignments;
 }
 
 
@@ -835,7 +1126,7 @@ function renderDomainCard(group) {
   const extraCount  = uniqueTabs.length - visibleTabs.length;
 
   const pageChips = visibleTabs.map(tab => {
-    let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group.domain);
+    let label = getTabDisplayTitle(tab, group.titleHostname || group.domain);
     // For localhost tabs, prepend port number so you can tell projects apart
     try {
       const parsed = new URL(tab.url);
@@ -1029,6 +1320,7 @@ async function renderStaticDashboard() {
   // --- Fetch tabs ---
   await fetchOpenTabs();
   const realTabs = getRealTabs();
+  const workspaceGroups = buildGoogleWorkspaceGroups(realTabs);
 
   // --- Group tabs by domain ---
   // Landing pages (Gmail inbox, Twitter home, etc.) get their own special group
@@ -1103,6 +1395,21 @@ async function renderStaticDashboard() {
         continue;
       }
 
+      const workspaceGroup = workspaceGroups.get(tab.id);
+      if (workspaceGroup) {
+        if (!groupMap[workspaceGroup.key]) {
+          groupMap[workspaceGroup.key] = {
+            domain:       workspaceGroup.key,
+            label:        workspaceGroup.label,
+            tabs:         [],
+            sortRank:     workspaceGroup.sortRank,
+            titleHostname: workspaceGroup.titleHostname,
+          };
+        }
+        groupMap[workspaceGroup.key].tabs.push(tab);
+        continue;
+      }
+
       let hostname;
       if (tab.url && tab.url.startsWith('file://')) {
         hostname = 'local-files';
@@ -1119,7 +1426,7 @@ async function renderStaticDashboard() {
   }
 
   if (landingTabs.length > 0) {
-    groupMap['__landing-pages__'] = { domain: '__landing-pages__', tabs: landingTabs };
+    groupMap['__landing-pages__'] = { domain: '__landing-pages__', tabs: landingTabs, sortRank: 0 };
   }
 
   // Sort: landing pages first, then domains from landing page sites, then by tab count
@@ -1130,16 +1437,18 @@ async function renderStaticDashboard() {
     if (landingHostnames.has(domain)) return true;
     return landingSuffixes.some(s => domain.endsWith(s));
   }
+  function getGroupSortRank(group) {
+    if (typeof group.sortRank === 'number') return group.sortRank;
+    return isLandingDomain(group.domain) ? 10 : 30;
+  }
   domainGroups = Object.values(groupMap).sort((a, b) => {
-    const aIsLanding = a.domain === '__landing-pages__';
-    const bIsLanding = b.domain === '__landing-pages__';
-    if (aIsLanding !== bIsLanding) return aIsLanding ? -1 : 1;
+    const rankDiff = getGroupSortRank(a) - getGroupSortRank(b);
+    if (rankDiff !== 0) return rankDiff;
 
-    const aIsPriority = isLandingDomain(a.domain);
-    const bIsPriority = isLandingDomain(b.domain);
-    if (aIsPriority !== bIsPriority) return aIsPriority ? -1 : 1;
+    const sizeDiff = b.tabs.length - a.tabs.length;
+    if (sizeDiff !== 0) return sizeDiff;
 
-    return b.tabs.length - a.tabs.length;
+    return (a.label || a.domain).localeCompare(b.label || b.domain);
   });
 
   // --- Render domain cards ---
