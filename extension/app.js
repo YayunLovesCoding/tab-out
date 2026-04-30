@@ -1328,6 +1328,12 @@ async function renderStaticDashboard() {
   const LANDING_PAGE_PATTERNS = [
     { hostname: 'mail.google.com', test: (p, h) =>
         !h.includes('#inbox/') && !h.includes('#sent/') && !h.includes('#search/') },
+    { hostname: 'calendar.google.com', test: p =>
+        p === '/' ||
+        p === '/calendar' ||
+        p === '/calendar/' ||
+        /^\/calendar(?:\/u\/\d+)?\/r$/.test(p) },
+    { hostname: 'notebooklm.google.com' },
     { hostname: 'x.com',               pathExact: ['/home'] },
     { hostname: 'www.linkedin.com',    pathExact: ['/'] },
     { hostname: 'github.com',          pathExact: ['/'] },
